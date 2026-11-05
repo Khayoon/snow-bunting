@@ -1,3 +1,4 @@
+<!doctype html><html><head><meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1,viewport-fit=cover"><style>:root{color-scheme:light;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}html{scroll-padding-top:env(safe-area-inset-top,0px)}body{margin:0;padding:0;font:14px -apple-system,BlinkMacSystemFont,sans-serif;background:#fff;color:#000}img{max-width:100%}[hidden]:not([hidden=until-found i]){display:none!important}</style></head><body>
 <meta charset="utf-8">
 <title>Migration Across the Americas</title>
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
@@ -114,8 +115,8 @@
 const BINS = 24;
 const TEX_W = 2048;
 const YEAR_SECONDS = 72;
-// Dot budget for the most numerous species; the others follow the square root of population.
-const MAX_DOTS = 30000;
+// Total dots on the globe. Species share them by the square root of population, so adding a species keeps density.
+const DOT_BUDGET = 118376;
 // Size of the per-species arrays in the shaders.
 const MAX_SPECIES = 24;
 const COLORS = {
@@ -123,8 +124,8 @@ const COLORS = {
   "Rufous Hummingbird": "#ffa62b", "Snow Goose": "#e9f6ff", "Bobolink": "#ffe066",
   "Fork-tailed Flycatcher": "#4fd6a8", "Sandhill Crane": "#5ab4ff", "Swainson's Hawk": "#d9c28a",
   "Franklin's Gull": "#38d9e8", "American Golden-Plover": "#8fe04a", "Hudsonian Godwit": "#ff7ad9",
-  "Semipalmated Sandpiper": "#a3b18a", "White-crested Elaenia": "#2fa36b", "Purple Martin": "#7b61ff",
-  "Arctic Tern": "#fdbcb4", "Red Knot": "#d6523c",
+  "Semipalmated Sandpiper": "#00a6a6", "White-crested Elaenia": "#2fa36b", "Purple Martin": "#7b61ff",
+  "Arctic Tern": "#c850ff", "Red Knot": "#d6523c",
 };
 // Named stopovers and wintering grounds. Each lights up only when the data puts birds there.
 const PLACES = [
@@ -211,10 +212,62 @@ function sampleInto(ix, u, v, out, at) {
   out[at + 1] = -90 + (ix.rows[row] + fr) * ix.cell;
 }
 
-function buildTracks(meta) {
+/* Land lookup on a 0.18-degree grid of the western hemisphere, with each cell's nearest land cell. */
+function landGrid(img) {
+  const size = 1024;
+  const c = document.createElement("canvas");
+  c.width = c.height = size;
+  const ctx = c.getContext("2d", { willReadFrequently: true });
+  ctx.drawImage(img, 0, 0, img.width / 2, img.height, 0, 0, size, size);
+  const px = ctx.getImageData(0, 0, size, size).data;
+  const nearest = new Int32Array(size * size).fill(-1);
+  const queue = new Int32Array(size * size);
+  let head = 0, tail = 0;
+  for (let i = 0; i < nearest.length; i++) {
+    if (px[i * 4] > 127) { nearest[i] = i; queue[tail++] = i; }
+  }
+  while (head < tail) {
+    const i = queue[head++];
+    const x = i % size;
+    for (const n of [x > 0 ? i - 1 : -1, x < size - 1 ? i + 1 : -1, i - size, i + size]) {
+      if (n >= 0 && n < nearest.length && nearest[n] < 0) { nearest[n] = nearest[i]; queue[tail++] = n; }
+    }
+  }
+  const cell = (lon, lat) => clamp(Math.floor((90 - lat) / 180 * size), 0, size - 1) * size + clamp(Math.floor((lon + 180) / 180 * size), 0, size - 1);
+  return {
+    isLand: (lon, lat) => { const i = cell(lon, lat); return nearest[i] === i; },
+    nearest(lon, lat) {
+      const i = nearest[cell(lon, lat)];
+      return [((i % size) + 0.5) / size * 180 - 180, 90 - (Math.floor(i / size) + 0.5) / size * 180];
+    },
+  };
+}
+
+/* Gives a resting dot its spot in the flock and makes sure that spot is on land or at the shore. */
+function settle(track, at, jx, jy, rand, land) {
+  const lon = track[at], lat = track[at + 1];
+  const stretch = 1 / Math.max(0.2, Math.cos(lat * Math.PI / 180));
+  let x = lon + jx * stretch, y = lat + jy;
+  for (let tries = 0; tries < 6 && !land.isLand(x, y); tries++) {
+    x = lon + (rand() - 0.5) * 1.8 * stretch;
+    y = lat + (rand() - 0.5) * 1.8;
+  }
+  if (!land.isLand(x, y)) {
+    const [nx, ny] = land.nearest(lon, lat);
+    x = nx; y = ny;
+    for (let tries = 0; tries < 4; tries++) {
+      const tx = nx + (rand() - 0.5) * 0.7 * stretch, ty = ny + (rand() - 0.5) * 0.7;
+      if (land.isLand(tx, ty)) { x = tx; y = ty; break; }
+    }
+  }
+  track[at] = x;
+  track[at + 1] = y;
+}
+
+function buildTracks(meta, land) {
   const spec = meta.species;
   const weight = spec.map((s) => Math.sqrt(s.population ?? s.assumed));
-  const scale = MAX_DOTS / Math.max(...weight);
+  const scale = DOT_BUDGET / weight.reduce((a, b) => a + b, 0);
   const counts = weight.map((w) => Math.round(w * scale));
   const n = counts.reduce((a, b) => a + b, 0);
   const rand = rng(20261104);
@@ -230,8 +283,13 @@ function buildTracks(meta) {
   const track = new Float32Array(n * BINS * 2);
   for (let i = 0; i < n; i++) {
     const u = rand(), v = rand();
+    const jx = rand() + rand() - 1, jy = rand() + rand() - 1;
     const ix = index[species[i]];
-    for (let b = 0; b < BINS; b++) sampleInto(ix[b], u, v, track, (i * BINS + b) * 2);
+    for (let b = 0; b < BINS; b++) {
+      const at = (i * BINS + b) * 2;
+      sampleInto(ix[b], u, v, track, at);
+      settle(track, at, jx, jy, rand, land);
+    }
   }
   return { n, species, track, counts };
 }
@@ -249,15 +307,18 @@ function smoothCircular(a, passes = 1) {
 
 function quantile(sorted, q) { return sorted[Math.floor(q * (sorted.length - 1))]; }
 
-function analyse(t) {
+function analyse(t, framed) {
   const step = 3, count = Math.floor(t.n / step);
+  // Species outside the camera's core flock would pull the view wider and pack every dot closer together.
+  const sample = [];
+  for (let k = 0; k < count; k++) if (framed[t.species[k * step]]) sample.push(k * step);
   const lat = [], lon = [], halfLat = [], halfLon = [], drift = [], travel = [], meanLat = [];
   for (let b = 0; b < BINS; b++) {
     const b2 = (b + 1) % BINS;
     let sw = 0, sLat = 0, sLon = 0, dLat = 0, dAbs = 0, all = 0;
-    const lats = new Float32Array(count), lons = new Float32Array(count);
-    for (let k = 0; k < count; k++) {
-      const i = k * step;
+    const lats = new Float32Array(sample.length), lons = new Float32Array(sample.length);
+    for (let k = 0; k < sample.length; k++) {
+      const i = sample[k];
       const x = t.track[(i * BINS + b) * 2], y = t.track[(i * BINS + b) * 2 + 1];
       const d = t.track[(i * BINS + b2) * 2 + 1] - y;
       const w = 0.25 + Math.min(Math.abs(d) / 6, 1);
@@ -268,9 +329,9 @@ function analyse(t) {
     lats.sort(); lons.sort();
     lat.push(sLat / sw);
     lon.push(sLon / sw);
-    meanLat.push(all / count);
-    drift.push(dLat / count);
-    travel.push(dAbs / count);
+    meanLat.push(all / sample.length);
+    drift.push(dLat / sample.length);
+    travel.push(dAbs / sample.length);
     halfLat.push(Math.max(quantile(lats, 0.93) - lat[b], lat[b] - quantile(lats, 0.07)));
     halfLon.push(Math.max(quantile(lons, 0.93) - lon[b], lon[b] - quantile(lons, 0.07)));
   }
@@ -360,10 +421,11 @@ void main() {
 const LINE_FS = `#version 300 es
 precision mediump float;
 in float vZ;
+uniform float uAlpha;
 out vec4 frag;
 void main() {
   if (vZ < 0.0) discard;
-  float a = 0.16 * smoothstep(0.0, 0.3, vZ);
+  float a = uAlpha * smoothstep(0.0, 0.3, vZ);
   frag = vec4(vec3(0.95, 0.88, 0.76) * a, a);
 }`;
 
@@ -377,27 +439,24 @@ vec2 key(int i, int k) {
   return texelFetch(uTrack, ivec2(n % TEX_W, n / TEX_W), 0).rg;
 }
 float hash(float x) { return fract(sin(x * 12.9898) * 43758.5453); }
+// A bird rests at each half-month's stopover, then flies to the next over about nine days, on its own departure day.
 vec2 trackAt(int i, float s) {
-  float k0 = floor(s), f = s - k0;
+  const float FLIGHT = 0.6;
+  float k0 = floor(s);
   int k = int(k0);
-  float f2 = f * f, f3 = f2 * f;
-  return ((1.0 - 3.0 * f + 3.0 * f2 - f3) * key(i, k - 1) + (4.0 - 6.0 * f2 + 3.0 * f3) * key(i, k)
-    + (1.0 + 3.0 * f + 3.0 * f2 - 3.0 * f3) * key(i, k + 1) + f3 * key(i, k + 2)) / 6.0;
+  float depart = hash(float(i) + float(k % BINS) * 0.37 + 0.31) * (1.0 - FLIGHT);
+  return mix(key(i, k), key(i, k + 1), smoothstep(depart, depart + FLIGHT, s - k0));
 }
 vec3 toSphere(vec2 ll) {
   vec2 r = radians(ll);
   float c = cos(r.y);
   return vec3(c * sin(r.x), sin(r.y), c * cos(r.x));
 }
-// Each dot keeps its own departure date and a fixed spot within the flock, plus a small drift.
+// A small drift keeps resting birds alive without carrying them off the shore.
 void particle(int i, float back, out vec3 pos, out float travelled) {
   float id = float(i);
-  float phase = (hash(id + 0.17) - 0.5) * 1.5;
-  float s = uBin + float(BINS) + phase;
-  vec2 ll = trackAt(i, s - back);
-  vec2 jitter = vec2(hash(id + 0.41) + hash(id + 0.53) - 1.0, hash(id + 0.67) + hash(id + 0.79) - 1.0) * 1.1;
-  vec2 drift = vec2(sin(uClock * 0.7 + id), cos(uClock * 0.53 + id * 1.7)) * 0.07;
-  vec2 off = jitter + drift;
+  vec2 ll = trackAt(i, uBin + float(BINS) - back);
+  vec2 off = vec2(sin(uClock * 0.7 + id), cos(uClock * 0.53 + id * 1.7)) * 0.03;
   off.x /= max(0.2, cos(radians(ll.y)));
   pos = toSphere(ll + off);
   travelled = 0.0;
@@ -581,12 +640,12 @@ async function main() {
     if (!r.ok) throw new Error(`Could not load ${src}.`);
     return r.json();
   });
-  const [meta, borders, night, land] = await Promise.all([
-    loadJson("data/birds.json"), loadJson("data/borders.json"), loadImage("assets/earth-night.jpg"), loadImage("assets/land.png"),
+  const [meta, borders, shores, night, land] = await Promise.all([
+    loadJson("data/birds.json"), loadJson("data/borders.json"), loadJson("data/shores.json"), loadImage("assets/earth-night.jpg"), loadImage("assets/land.png"),
   ]);
 
-  const tracks = buildTracks(meta);
-  const flow = analyse(tracks);
+  const tracks = buildTracks(meta, landGrid(land));
+  const flow = analyse(tracks, meta.species.map((s) => s.camera !== false));
 
   /* Legend */
   const list = $("species");
@@ -664,14 +723,18 @@ async function main() {
   const dotVao = speciesVao(dotProg, 0);
   const trailVao = speciesVao(trailProg, 1);
 
-  const borderData = borderVertices(borders);
-  const lineVao = gl.createVertexArray();
-  gl.bindVertexArray(lineVao);
-  gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
-  gl.bufferData(gl.ARRAY_BUFFER, borderData, gl.STATIC_DRAW);
   const lineLoc = gl.getAttribLocation(lineProg.p, "aPos");
-  gl.enableVertexAttribArray(lineLoc);
-  gl.vertexAttribPointer(lineLoc, 3, gl.FLOAT, false, 0, 0);
+  const lineSet = (lines) => {
+    const data = borderVertices(lines);
+    const vao = gl.createVertexArray();
+    gl.bindVertexArray(vao);
+    gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+    gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
+    gl.enableVertexAttribArray(lineLoc);
+    gl.vertexAttribPointer(lineLoc, 3, gl.FLOAT, false, 0, 0);
+    return { vao, count: data.length / 3 };
+  };
+  const borderLines = lineSet(borders), shoreLines = lineSet(shores);
 
   const colors = new Float32Array(MAX_SPECIES * 3);
   meta.species.forEach((s, i) => colors.set(hexRgb(COLORS[s.name]), i * 3));
@@ -784,11 +847,15 @@ async function main() {
     gl.drawArrays(gl.TRIANGLES, 0, 3);
 
     gl.enable(gl.BLEND);
-    gl.useProgram(lineProg.p);
-    gl.bindVertexArray(lineVao);
-    gl.uniformMatrix3fv(lineProg.u.uR, false, R);
-    gl.uniform2f(lineProg.u.uScale, scale[0], scale[1]);
-    gl.drawArrays(gl.LINES, 0, borderData.length / 3);
+    const drawLines = (set, alpha) => {
+      gl.useProgram(lineProg.p);
+      gl.bindVertexArray(set.vao);
+      gl.uniformMatrix3fv(lineProg.u.uR, false, R);
+      gl.uniform2f(lineProg.u.uScale, scale[0], scale[1]);
+      gl.uniform1f(lineProg.u.uAlpha, alpha);
+      gl.drawArrays(gl.LINES, 0, set.count);
+    };
+    drawLines(borderLines, 0.16);
 
     const shared = (prog) => {
       gl.useProgram(prog.p);
@@ -809,6 +876,9 @@ async function main() {
     gl.uniform1f(dotProg.u.uSize, clamp(0.75 + radius / ph * 0.7, 1.1, 2.2) * view.dpr);
     gl.bindVertexArray(dotVao);
     gl.drawArrays(gl.POINTS, 0, tracks.n);
+
+    // Shorelines go on top so a dense flock never hides them.
+    drawLines(shoreLines, 0.34);
 
     layoutLabels(R, radius, view, t);
     return t;
@@ -1079,3 +1149,5 @@ main().catch((e) => {
   console.error(e);
 });
 </script>
+
+</body></html>
