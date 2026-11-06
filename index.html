@@ -58,7 +58,7 @@
   #dial #date { fill: var(--ink); font-size: 21px; font-weight: 500; }
   #dial #stage { fill: var(--ink-soft); font-size: 10.5px; letter-spacing: .02em; }
   #play, #export {
-    all: unset; cursor: pointer; font-size: 12px; font-weight: 500; letter-spacing: .06em; text-transform: uppercase; color: var(--ink);
+    all: unset; white-space: nowrap; cursor: pointer; font-size: 12px; font-weight: 500; letter-spacing: .06em; text-transform: uppercase; color: var(--ink);
     border: 1px solid var(--rule); border-radius: 3px; padding: 2px 12px; background: rgba(0,0,0,.45);
   }
   #play:hover, #export:hover { border-color: var(--ink); }
@@ -92,7 +92,7 @@
   <div id="notes">
     <p>Dots scale with population, compressed. Each dot stands for many birds.</p>
     <p class="fine">Simulated from eBird reports (GBIF). Counts: Partners in Flight, USFWS, BirdLife, Audubon. Arctic Tern count is worldwide and Red Knot is one subspecies. Fork-tailed Flycatcher and White-crested Elaenia counts unknown, dots assumed.
-      Imagery: NASA. Borders: Natural Earth. Concept after Aaron J. Becker, mapped.earth.</p>
+      Imagery: NASA. Borders and lakes: Natural Earth. Concept after Aaron J. Becker, mapped.earth.</p>
   </div>
 </section>
 
@@ -117,6 +117,8 @@ const TEX_W = 2048;
 const YEAR_SECONDS = 72;
 // Total dots on the globe. Species share them by the square root of population, so adding a species keeps density.
 const DOT_BUDGET = 118376;
+// A flock is settled while its typical dots shift less than this many degrees north or south in a half-month.
+const SETTLED_SHIFT = 3;
 // Size of the per-species arrays in the shaders.
 const MAX_SPECIES = 24;
 const COLORS = {
@@ -223,8 +225,10 @@ function landGrid(img) {
   const nearest = new Int32Array(size * size).fill(-1);
   const queue = new Int32Array(size * size);
   let head = 0, tail = 0;
+  // A cell counts only if its neighbours are land too, which keeps resting dots just inside the shoreline.
+  const solid = (i) => i >= 0 && i < nearest.length && px[i * 4] > 127;
   for (let i = 0; i < nearest.length; i++) {
-    if (px[i * 4] > 127) { nearest[i] = i; queue[tail++] = i; }
+    if (solid(i) && solid(i - 1) && solid(i + 1) && solid(i - size) && solid(i + size)) { nearest[i] = i; queue[tail++] = i; }
   }
   while (head < tail) {
     const i = queue[head++];
@@ -264,6 +268,46 @@ function settle(track, at, jx, jy, rand, land) {
   track[at + 1] = y;
 }
 
+/* Sightings shift a little between half-months, which reshuffles ranks even when a flock is going nowhere and would
+   send dots streaking across the continent in mid-winter. While a species' latitude range holds steady, its dots
+   rest in one place for the whole spell. */
+function holdSettledFlocks(track, species, speciesCount) {
+  const key = (i, b) => (i * BINS + ((b % BINS) + BINS) % BINS) * 2;
+  for (let s = 0; s < speciesCount; s++) {
+    const dots = [];
+    for (let i = 0; i < species.length; i++) if (species[i] === s) dots.push(i);
+    const steady = [];
+    for (let b = 0; b < BINS; b++) {
+      const shift = new Float32Array(dots.length);
+      dots.forEach((i, k) => { shift[k] = track[key(i, b + 1) + 1] - track[key(i, b) + 1]; });
+      shift.sort();
+      steady.push([0.2, 0.5, 0.8].every((q) => Math.abs(quantile(shift, q)) < SETTLED_SHIFT));
+    }
+    const first = steady.indexOf(false);
+    if (first < 0) continue;
+    for (let b = first + 1; b < first + BINS; b++) {
+      if (!steady[b % BINS]) continue;
+      let end = b;
+      while (end < first + BINS && steady[end % BINS]) end++;
+      // Hops b to end-1 are steady, so keys b to end all belong to this spell. Each dot rests at the spot nearest
+      // its median position, so one half-month of stray reports cannot hold it somewhere odd all season.
+      const size = end - b + 1;
+      const xs = new Float32Array(size), ys = new Float32Array(size);
+      for (const i of dots) {
+        for (let n = 0; n < size; n++) { xs[n] = track[key(i, b + n)]; ys[n] = track[key(i, b + n) + 1]; }
+        const midX = quantile(xs.slice().sort(), 0.5), midY = quantile(ys.slice().sort(), 0.5);
+        let best = 0, bestDist = Infinity;
+        for (let n = 0; n < size; n++) {
+          const dist = (xs[n] - midX) ** 2 + (ys[n] - midY) ** 2;
+          if (dist < bestDist) { bestDist = dist; best = n; }
+        }
+        for (let n = 0; n < size; n++) { track[key(i, b + n)] = xs[best]; track[key(i, b + n) + 1] = ys[best]; }
+      }
+      b = end;
+    }
+  }
+}
+
 function buildTracks(meta, land) {
   const spec = meta.species;
   const weight = spec.map((s) => Math.sqrt(s.population ?? s.assumed));
@@ -291,6 +335,7 @@ function buildTracks(meta, land) {
       settle(track, at, jx, jy, rand, land);
     }
   }
+  holdSettledFlocks(track, species, spec.length);
   return { n, species, track, counts };
 }
 
@@ -439,23 +484,25 @@ vec2 key(int i, int k) {
   return texelFetch(uTrack, ivec2(n % TEX_W, n / TEX_W), 0).rg;
 }
 float hash(float x) { return fract(sin(x * 12.9898) * 43758.5453); }
-// A bird rests at each half-month's stopover, then flies to the next over about nine days, on its own departure day.
+// A smooth curve through the half-month stopovers, so flocks flow and swell as blobs instead of hopping in step.
 vec2 trackAt(int i, float s) {
-  const float FLIGHT = 0.6;
-  float k0 = floor(s);
+  float k0 = floor(s), f = s - k0;
   int k = int(k0);
-  float depart = hash(float(i) + float(k % BINS) * 0.37 + 0.31) * (1.0 - FLIGHT);
-  return mix(key(i, k), key(i, k + 1), smoothstep(depart, depart + FLIGHT, s - k0));
+  float f2 = f * f, f3 = f2 * f;
+  return ((1.0 - 3.0 * f + 3.0 * f2 - f3) * key(i, k - 1) + (4.0 - 6.0 * f2 + 3.0 * f3) * key(i, k)
+    + (1.0 + 3.0 * f + 3.0 * f2 - 3.0 * f3) * key(i, k + 1) + f3 * key(i, k + 2)) / 6.0;
 }
 vec3 toSphere(vec2 ll) {
   vec2 r = radians(ll);
   float c = cos(r.y);
   return vec3(c * sin(r.x), sin(r.y), c * cos(r.x));
 }
-// A small drift keeps resting birds alive without carrying them off the shore.
+// Each dot keeps its own departure date, plus a small drift that keeps resting birds alive without carrying them
+// off the shore.
 void particle(int i, float back, out vec3 pos, out float travelled) {
   float id = float(i);
-  vec2 ll = trackAt(i, uBin + float(BINS) - back);
+  float phase = (hash(id + 0.17) - 0.5) * 1.5;
+  vec2 ll = trackAt(i, uBin + float(BINS) + phase - back);
   vec2 off = vec2(sin(uClock * 0.7 + id), cos(uClock * 0.53 + id * 1.7)) * 0.03;
   off.x /= max(0.2, cos(radians(ll.y)));
   pos = toSphere(ll + off);
@@ -500,18 +547,18 @@ uniform vec3 uCol[${MAX_SPECIES}];
 out vec4 vC;
 ${TRACK_GLSL}
 void main() {
-  const float TRAIL_BINS = 0.17;
+  const float TRAIL_BINS = 0.05;
   int i = gl_InstanceID;
   vec3 head, tail; float t;
   particle(i, 0.0, head, t);
   particle(i, TRAIL_BINS, tail, t);
   // Resting birds have no trail; fast ones draw a streak that fades towards the tail.
   float len = degrees(acos(clamp(dot(head, tail), -1.0, 1.0)));
-  float moving = smoothstep(0.4, 2.5, len) * (1.0 - smoothstep(9.0, 14.0, len));
+  float moving = smoothstep(0.4, 2.5, len) * (1.0 - smoothstep(10.0, 16.0, len));
   vec3 p = uR * (gl_VertexID == 0 ? head : tail);
   int sp = int(aSpecies);
   gl_Position = vec4(p.xy * uScale, (p.z > 0.0 && moving > 0.0) ? 0.0 : 2.0, 1.0);
-  vC = vec4(uCol[sp], (gl_VertexID == 0 ? 0.26 : 0.0) * moving * uOn[sp] * smoothstep(0.0, 0.18, p.z));
+  vC = vec4(uCol[sp], (gl_VertexID == 0 ? 0.2 : 0.0) * moving * uOn[sp] * smoothstep(0.0, 0.18, p.z));
 }`;
 const TRAIL_FS = `#version 300 es
 precision mediump float;
@@ -870,10 +917,12 @@ async function main() {
     shared(trailProg);
     gl.bindVertexArray(trailVao);
     // Dots are shuffled, so the first share of them is a fair sample to draw trails for.
-    gl.drawArraysInstanced(gl.LINES, 0, 2, Math.floor(tracks.n * 0.3));
+    gl.drawArraysInstanced(gl.LINES, 0, 2, Math.floor(tracks.n * 0.15));
 
     shared(dotProg);
-    gl.uniform1f(dotProg.u.uSize, clamp(0.75 + radius / ph * 0.7, 1.1, 2.2) * view.dpr);
+    // Small screens fit the same flocks into less room, so dots shrink with them to leave the land visible.
+    const roomy = clamp(Math.sqrt(Math.min(view.W, view.H) / 750), 0.6, 1);
+    gl.uniform1f(dotProg.u.uSize, Math.max(1, clamp(0.75 + radius / ph * 0.7, 1.1, 2.2) * view.dpr * roomy));
     gl.bindVertexArray(dotVao);
     gl.drawArrays(gl.POINTS, 0, tracks.n);
 
